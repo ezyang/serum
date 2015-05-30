@@ -1,0 +1,11 @@
+#include "Cmm.h"
+
+cheneycopyzh ( P_ p )
+{
+  gcptr root;
+  W_ sp;
+  again: MAYBE_GC(again);
+  ("ptr" root) = ccall cheneycopy(MyCapability() "ptr", p "ptr");
+  ("ptr" sp) = ccall getStablePtr(root "ptr");
+  return (sp);
+}
