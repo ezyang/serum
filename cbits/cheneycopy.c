@@ -5,17 +5,71 @@
 
 #include <string.h>
 
+extern void *stgMallocBytes(int, char *);
+extern void stgFree(void*);
+
+typedef struct bdescr_list_ {
+    bdescr *bd;
+    struct bdescr_list_ *link;
+} bdescr_list;
+
+static bdescr *allocate_in_region(CapabilityPublic *cap) {
+    // allocate() version
+
+    bdescr *bd = cap->r.rCurrentNursery->link;
+
+    if (bd == NULL) {
+        bd = allocBlock_lock();
+        cap->r.rNursery->n_blocks++;
+        initBdescr(bd, g0, g0);
+        bd->flags = 0;
+    } else {
+        bd->free = bd->start;
+        cap->r.rCurrentNursery->link = bd->link;
+        if (bd->link != NULL) {
+            bd->link->u.back = cap->r.rCurrentNursery;
+        }
+    }
+    dbl_link_onto(bd, &cap->r.rNursery->blocks);
+    return bd;
+}
+
+        /*
+static bdescr *allocate_in_region(CapabilityPublic *cap) {
+    // pinned version, HOWEVER this one needs more work
+    // to turn it into bytestrings...
+
+    StgPtr given = allocatePinned((Capability*)cap, stg_max(sizeW, 8000));
+    bd = Bdescr(given);
+    ASSERT(bd->start == given);
+    bd->free = bd->start;
+    return bd;
+}
+        */
+
 static StgPtr
-allocate_loop (CapabilityPublic *cap, bdescr *bd, StgWord sizeW)
+// bd + tail == more register pressure but avoid a deref in the fast loop
+allocate_loop (CapabilityPublic *cap, bdescr **dest, bdescr_list **tail, StgWord sizeW)
 {
     StgWord next_size;
     StgPtr at;
-    ASSERT(!(bd->flags & BF_PINNED));
+    bdescr *bd = *dest;
 
-    // TODO: loop
+    ASSERT((*tail)->bd == bd);
+    ASSERT((*tail)->link == NULL);
+
     if (bd->free + sizeW > bd->start + BLOCK_SIZE_W * bd->blocks) {
-        barf("You tried to copy something bigger than a megablock!  (not implemented yet)");
+        // 64k chunk size
+        bdescr_list *old_tail = *tail;
+        bd = allocate_in_region(cap);
+        bdescr_list *new_tail = stgMallocBytes(sizeof(bdescr_list), "bdescr_list");
+        *tail = new_tail;
+        old_tail->link = new_tail;
+        new_tail->bd = bd;
+        new_tail->link = NULL;
+        *dest = new_tail->bd;
     }
+
     at = bd->free;
     bd->free += sizeW;
     return at;
@@ -29,15 +83,14 @@ unroll_memcpy(StgPtr to, StgPtr from, StgWord size)
 }
 
 static void
-copy_tag (CapabilityPublic *cap, bdescr *bd, StgClosure **p, StgClosure *from, StgWord tag)
+copy_tag (CapabilityPublic *cap, bdescr **dest, bdescr_list **tail, StgClosure **p, StgClosure *from, StgWord tag)
 {
     StgPtr to;
     StgWord sizeW;
 
     sizeW = closure_sizeW(from);
 
-    to = allocate_loop(cap, bd, sizeW);
-    ASSERT(!(Bdescr(to)->flags & BF_PINNED));
+    to = allocate_loop(cap, dest, tail, sizeW);
 
     // unroll memcpy for small sizes because we can
     // benefit of known alignment
@@ -51,7 +104,7 @@ copy_tag (CapabilityPublic *cap, bdescr *bd, StgClosure **p, StgClosure *from, S
 }
 
 static void
-simple_evacuate (CapabilityPublic *cap, bdescr *bd, StgClosure **p)
+simple_evacuate (CapabilityPublic *cap, bdescr **dest, bdescr_list **tail, StgClosure **p)
 {
     StgWord tag;
     StgClosure *from;
@@ -72,7 +125,7 @@ simple_evacuate (CapabilityPublic *cap, bdescr *bd, StgClosure **p)
         }
 
         *p = from;
-        return simple_evacuate(cap, bd, p);
+        return simple_evacuate(cap, dest, tail, p);
 
     case IND:
     case IND_STATIC:
@@ -81,16 +134,17 @@ simple_evacuate (CapabilityPublic *cap, bdescr *bd, StgClosure **p)
         *p = from;
         // Evac.c uses a goto, but let's rely on a smart compiler
         // and get readable code instead
-        return simple_evacuate(cap, bd, p);
+        return simple_evacuate(cap, dest, tail, p);
 
     default:
-        copy_tag(cap, bd, p, from, tag);
+        copy_tag(cap, dest, tail, p, from, tag);
     }
 }
 
 static void
 simple_scavenge_mut_arr_ptrs (CapabilityPublic       *cap,
-                              bdescr *bd,
+                              bdescr **dest,
+                              bdescr_list **tail,
                               StgMutArrPtrs    *a)
 {
     StgPtr p, q;
@@ -98,12 +152,16 @@ simple_scavenge_mut_arr_ptrs (CapabilityPublic       *cap,
     p = (StgPtr)&a->payload[0];
     q = (StgPtr)&a->payload[a->ptrs];
     for (; p < q; p++) {
-        simple_evacuate(cap, bd, (StgClosure**)p);
+        simple_evacuate(cap, dest, tail, (StgClosure**)p);
     }
 }
 
+#ifdef DEBUG
+extern void        printClosure    ( StgClosure *obj );
+#endif
+
 static void
-simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, StgPtr p)
+simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, bdescr **dest, bdescr_list **tail, StgPtr p)
 {
     StgInfoTable *info;
 
@@ -113,15 +171,15 @@ simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, StgPtr p)
 
         switch (info->type) {
         case CONSTR_1_0:
-            simple_evacuate(cap, bd, &((StgClosure*)p)->payload[0]);
+            simple_evacuate(cap, dest, tail, &((StgClosure*)p)->payload[0]);
         case CONSTR_0_1:
             p += sizeofW(StgClosure) + 1;
             break;
 
         case CONSTR_2_0:
-            simple_evacuate(cap, bd, &((StgClosure*)p)->payload[1]);
+            simple_evacuate(cap, dest, tail, &((StgClosure*)p)->payload[1]);
         case CONSTR_1_1:
-            simple_evacuate(cap, bd, &((StgClosure*)p)->payload[0]);
+            simple_evacuate(cap, dest, tail, &((StgClosure*)p)->payload[0]);
         case CONSTR_0_2:
             p += sizeofW(StgClosure) + 2;
             break;
@@ -135,7 +193,7 @@ simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, StgPtr p)
 
             end = (P_)((StgClosure *)p)->payload + info->layout.payload.ptrs;
             for (p = (P_)((StgClosure *)p)->payload; p < end; p++) {
-                simple_evacuate(cap, bd, (StgClosure **)p);
+                simple_evacuate(cap, dest, tail, (StgClosure **)p);
             }
             p += info->layout.payload.nptrs;
             break;
@@ -147,11 +205,10 @@ simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, StgPtr p)
 
         case MUT_ARR_PTRS_FROZEN:
         case MUT_ARR_PTRS_FROZEN0:
-            simple_scavenge_mut_arr_ptrs(cap, bd, (StgMutArrPtrs*)p);
+            simple_scavenge_mut_arr_ptrs(cap, dest, tail, (StgMutArrPtrs*)p);
             p += mut_arr_ptrs_sizeW((StgMutArrPtrs*)p);
             break;
 
-#ifdef SMALL_MUT_ARR_PTRS_FROZEN
         case SMALL_MUT_ARR_PTRS_FROZEN:
         case SMALL_MUT_ARR_PTRS_FROZEN0:
         {
@@ -159,12 +216,11 @@ simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, StgPtr p)
             StgSmallMutArrPtrs *arr = (StgSmallMutArrPtrs*)p;
 
             for (i = 0; i < arr->ptrs; i++)
-                simple_evacuate(cap, bd, &arr->payload[i]);
+                simple_evacuate(cap, dest, tail, &arr->payload[i]);
 
             p += sizeofW(StgSmallMutArrPtrs) + arr->ptrs;
             break;
         }
-#endif
 
         case IND:
         case BLACKHOLE:
@@ -173,19 +229,25 @@ simple_scavenge_block (CapabilityPublic *cap, bdescr *bd, StgPtr p)
             barf("IND/BLACKHOLE in Compact");
 
         default:
-            barf("Invalid non-NFData closure in Compact\n");
+#ifdef DEBUG
+            printClosure((StgClosure *)p);
+#endif
+            barf("Invalid non-NFData closure");
         }
     }
 }
 
-
-static void
-scavenge_loop (CapabilityPublic *cap, bdescr *bd, StgPtr p)
+static W_
+scavenge_loop (CapabilityPublic *cap, bdescr_list *cur, bdescr **dest, bdescr_list **tail)
 {
-    // Scavenge the first block
-    simple_scavenge_block(cap, bd, p);
-
-    // TODO: loop
+    W_ chunks = 0;
+    while (cur != NULL) {
+        chunks++;
+        bdescr *bd = cur->bd;
+        simple_scavenge_block(cap, bd, dest, tail, bd->start);
+        cur = cur->link;
+    }
+    return chunks;
 }
 
 StgPtr
@@ -193,19 +255,17 @@ cheneycopy (CapabilityPublic *cap, StgClosure *p)
 {
     StgClosure *tagged_root;
     tagged_root = p;
-    bdescr *bd;
 
-    // pessimal case!
-    W_ blocks = BLOCKS_PER_MBLOCK-1;
-    bd = allocGroup_lock(blocks);
-    cap->r.rNursery->n_blocks += blocks;
-    initBdescr(bd, g0, g0);
-    bd->flags = 0;
-    dbl_link_onto(bd, &cap->r.rNursery->blocks);
+    // TODO pessimal behavior if first object doesn't fit
+    bdescr *bd = allocate_in_region(cap);
+    bdescr_list *cur = (bdescr_list*)stgMallocBytes(sizeof(bdescr_list), "bdescr_list");
+    cur->bd = bd;
+    cur->link = NULL;
+    bdescr_list *tail = cur;
+    bdescr *dest = bd;
 
-    bd->free = bd->start;
+    simple_evacuate(cap, &dest, &tail, &tagged_root);
+    W_ chunks = scavenge_loop(cap, cur, &dest, &tail);
 
-    simple_evacuate(cap, bd, &tagged_root);
-    scavenge_loop(cap, bd, (P_)UNTAG_CLOSURE(tagged_root));
     return (StgPtr)tagged_root;
 }

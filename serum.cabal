@@ -13,5 +13,7 @@ executable serum
   build-depends:       base == 4.*, deepseq, binary, bytestring, criterion, ghc-prim
   c-sources: cbits/cheneycopy.c cbits/cheneycopy-prim.cmm
   default-language:    Haskell2010
-  ghc-options: -O2 -debug -rtsopts -DDEBUG
-  cc-options: -g -O2 -DDEBUG
+  --ghc-options: -O2 -debug -rtsopts -DDEBUG
+  --cc-options: -g -DDEBUG
+  ghc-options: -O2 -rtsopts
+  cc-options: -O2
