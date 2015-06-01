@@ -1,0 +1,63 @@
+A few interesting things about this benchmark:
+
+    1. Using 'env' has a very interesting impact on the GC property
+    of the code: this is because env is run ONCE per the set of
+    benchmarks, and then retained as we iterate over them.  This
+    increases GC pressure, and means that it is often faster to just
+    generate the tree as PART OF THE TEST.  Example case of this is
+    gen-copy-binaryE (generate in test loop) and gen-copy-binaryF
+    (generate outside test loop): gen-copy-binaryF does "less"
+    computation but is slower because the takes longer to run, because
+    the residency is higher:
+
+ezyang@sabre:~/Dev/serum$ dist/build/serum/serum 15 -n 200 gen-copy-binaryE +RTS -s 
+benchmarking gen-copy-binaryE
+   6,732,290,448 bytes allocated in the heap
+   4,609,702,392 bytes copied during GC
+       2,000,192 bytes maximum residency (1203 sample(s))
+          81,864 bytes maximum slop
+               8 MB total memory in use (0 MB lost due to fragmentation)
+
+                                     Tot time (elapsed)  Avg pause  Max pause
+  Gen  0     11599 colls,     0 par    5.028s   6.042s     0.0005s    0.0126s
+  Gen  1      1203 colls,     0 par    2.588s   3.077s     0.0026s    0.0059s
+
+  INIT    time    0.000s  (  0.000s elapsed)
+  MUT     time    2.612s  (  3.055s elapsed)
+  GC      time    7.616s  (  9.118s elapsed)
+  EXIT    time    0.000s  (  0.001s elapsed)
+  Total   time   10.228s  ( 12.174s elapsed)
+
+  %GC     time      74.5%  (74.9% elapsed)
+
+  Alloc rate    2,577,446,572 bytes per MUT second
+
+  Productivity  25.5% of total user, 21.5% of total elapsed
+
+ezyang@sabre:~/Dev/serum$ dist/build/serum/serum 15 -n 200 gen-copy-binaryF +RTS -s 
+benchmarking gen-copy-binaryF
+   6,054,136,976 bytes allocated in the heap
+   4,864,346,720 bytes copied during GC
+       3,450,896 bytes maximum residency (703 sample(s))
+          94,560 bytes maximum slop
+              11 MB total memory in use (0 MB lost due to fragmentation)
+
+                                     Tot time (elapsed)  Avg pause  Max pause
+  Gen  0     10905 colls,     0 par    5.984s   6.173s     0.0006s    0.0052s
+  Gen  1       703 colls,     0 par    3.444s   3.371s     0.0048s    0.0090s
+
+  INIT    time    0.000s  (  0.000s elapsed)
+  MUT     time    2.740s  (  2.916s elapsed)
+  GC      time    9.428s  (  9.544s elapsed)
+  EXIT    time    0.000s  (  0.001s elapsed)
+  Total   time   12.168s  ( 12.462s elapsed)
+
+  %GC     time      77.5%  (76.6% elapsed)
+
+  Alloc rate    2,209,539,042 bytes per MUT second
+
+  Productivity  22.5% of total user, 22.0% of total elapsed
+
+    2. However, gen-copyE versus gen-copyF have a pretty big difference.
+    If you look at the GC stats, gen-copyF manages to largely avoid all
+    GC.  It's not really clear how it manages to pull this off.
